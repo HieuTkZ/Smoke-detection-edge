@@ -10,10 +10,10 @@
 //  2. Đọc tín hiệu analog từ mạch photodiode tại GPIO34.
 //  3. Stream dữ liệu ADC trực tiếp lên trình duyệt bằng Server-Sent Events (SSE).
 //  4. Hiển thị đồ thị ADC thời gian thực.
-//  5. Luôn giữ buffer 3 giây gần nhất; khi ADC vượt START_THRESHOLD,
-//     phiên log gồm cả dữ liệu 3 giây trước trigger.
-//  6. Khi ADC thấp hơn STOP_THRESHOLD, tiếp tục ghi thêm 3 giây;
-//     nếu tín hiệu tăng lại thì hủy chờ kết thúc.
+//  5. Bắt đầu phiên khi IR hoặc MP-2 AO đạt START_THRESHOLD liên tục 5 giây.
+//     Vẫn giữ 3 giây dữ liệu trước thời điểm trigger để không mất phần pre-trigger.
+//  6. Kết thúc phiên khi cả IR và MP-2 AO cùng <= STOP_THRESHOLD liên tục 5 giây;
+//     nếu một trong hai tín hiệu tăng lại thì hủy chờ kết thúc.
 //  7. Mỗi log lưu:
 //       - Đồ thị ADC theo thời gian
 //       - IR ADC lớn nhất / trung bình
@@ -29,14 +29,20 @@
 //       - Số mẫu
 //  8. Các log hoàn thành được lưu trong localStorage của trình duyệt,
 //     nên refresh trang vẫn còn dữ liệu.
+//
+//  Lưu ý:
+//  - Logic hiện tại giả sử: khói tăng -> ADC tăng.
+//  - Nếu mạch của bạn cho quan hệ ngược lại (khói tăng -> ADC giảm),
+//    cần đảo điều kiện START/STOP trong hàm processMeasurement() ở JavaScript.
+// ============================================================================
+
 // ============================================================================
 // CẤU HÌNH WIFI
 // ============================================================================
 
 // Thay bằng tên Wi-Fi và mật khẩu thực tế.
-const char* WIFI_SSID = "Na Tri";
-const char* WIFI_PASSWORD = "88888888";
-
+const char* WIFI_SSID = "Thu Suong";
+const char* WIFI_PASSWORD = "0906620436";
 
 // ============================================================================
 // CẤU HÌNH ADC
@@ -66,14 +72,12 @@ const unsigned long SERIAL_PRINT_INTERVAL_MS = 500;
 unsigned long lastSampleTime = 0;
 unsigned long lastSerialPrintTime = 0;
 
-
 // ============================================================================
 // CẤU HÌNH TỰ ĐỘNG KẾT NỐI LẠI WIFI
 // ============================================================================
 
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 unsigned long lastWiFiReconnectTime = 0;
-
 
 // ============================================================================
 // WEB SERVER + SERVER SENT EVENTS
@@ -85,7 +89,6 @@ AsyncWebServer server(80);
 // Endpoint /events dùng để stream dữ liệu ADC xuống trình duyệt.
 AsyncEventSource events("/events");
 
-
 // ============================================================================
 // TRANG WEB
 // ============================================================================
@@ -96,7 +99,7 @@ const char PAGE[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ESP32 Smoke Sensor Logger</title>
-<style> *{box-sizing:border-box;}body{margin:0;padding:20px;background:#111827;color:#f3f4f6;font-family:Arial,sans-serif;}.container{max-width:1200px;margin:auto;}h1,h2{margin-top:0;}.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:15px;margin-bottom:20px;}.header h1{margin-bottom:5px;}.subtitle{color:#9ca3af;}.statusBox{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#1f2937;border-radius:30px;}.statusDot{width:12px;height:12px;border-radius:50%;background:#f59e0b;box-shadow:0 0 8px #f59e0b;}.statusText{color:#f59e0b;font-size:14px;font-weight:bold;}.chartBox{padding:15px;background:#1f2937;border-radius:12px;}.realtimeGrid{display:grid;grid-template-columns:1fr;gap:16px;}.chartTitle{margin-bottom:4px;font-size:16px;font-weight:bold;}.chartUnit{margin-bottom:10px;color:#9ca3af;font-size:13px;}#irChart,#gasAnalogChart,#gasDigitalChart{width:100%;height:300px;display:block;}#gasDigitalChart{height:210px;}.liveControls{margin-top:12px;margin-bottom:5px;}.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:15px;}button{padding:10px 18px;border:none;border-radius:8px;font-size:15px;cursor:pointer;}#pauseBtn{background:#f59e0b;color:#111827;}#clearLiveBtn{background:#374151;color:white;}#clearLogsBtn{background:#7f1d1d;color:white;}.recordPanel{display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap;margin-top:20px;padding:16px 18px;background:#1f2937;border-radius:12px;}.recordInfo{color:#9ca3af;font-size:14px;}.recordStatus{padding:8px 14px;border-radius:20px;font-size:13px;font-weight:bold;}.recordStatus.waiting{background:#374151;color:#d1d5db;}.recordStatus.recording{background:#7f1d1d;color:#fca5a5;}.logSection{margin-top:25px;}.logHeader{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:15px;}.logHeader h2{margin-bottom:0;}.logItem{margin-bottom:18px;padding:18px;background:#1f2937;border-radius:12px;}.logTitleRow{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:15px;}.logTitle{font-size:18px;font-weight:bold;}.logActions{display:flex;gap:8px;flex-wrap:wrap;}.downloadCsvBtn{padding:8px 14px;background:#059669;color:white;font-size:14px;font-weight:bold;}.downloadCsvBtn:hover{filter:brightness(1.08);}.logInfo{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:15px;}.logInfoItem{padding:12px;background:#111827;border-radius:8px;}.logInfoLabel{margin-bottom:5px;color:#9ca3af;font-size:12px;}.logInfoValue{font-size:16px;font-weight:bold;}.logCanvas{width:100%;height:230px;display:block;background:#111827;border-radius:8px;}.logChartGroup{display:grid;grid-template-columns:1fr;gap:14px;}.logChartBlock{position:relative;padding:12px;background:#111827;border-radius:10px;}.logTooltip{position:absolute;z-index:5;top:44px;right:24px;display:none;min-width:210px;padding:10px 12px;background:rgba(3,7,18,0.94);border:1px solid #4b5563;border-radius:8px;color:#e5e7eb;font-size:12px;line-height:1.55;pointer-events:none;box-shadow:0 8px 24px rgba(0,0,0,0.28);}.logTooltip.active{display:block;}.logTooltipTitle{margin-bottom:4px;color:#ffffff;font-weight:bold;}.triggerLegend{margin:0 0 12px;color:#9ca3af;font-size:12px;}.logChartTitle{margin-bottom:10px;color:#d1d5db;font-size:14px;font-weight:bold;}.logChartBlock .logCanvas{background:#0b1220;}.digitalCanvas{height:180px;}.emptyLog{padding:20px;background:#1f2937;color:#9ca3af;border-radius:12px;text-align:center;}@media (max-width:950px){.logInfo{grid-template-columns:repeat(2,1fr);}}@media (max-width:520px){body{padding:12px;}#irChart,#gasAnalogChart{height:260px;}#gasDigitalChart{height:180px;}.logInfo{grid-template-columns:1fr;}.logCanvas{height:200px;}}</style>
+<style>*{box-sizing:border-box;}body{margin:0;padding:20px;background:#111827;color:#f3f4f6;font-family:Arial,sans-serif;}.container{max-width:1200px;margin:auto;}h1,h2{margin-top:0;}.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:15px;margin-bottom:20px;}.header h1{margin-bottom:5px;}.subtitle{color:#9ca3af;}.statusBox{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#1f2937;border-radius:30px;}.statusDot{width:12px;height:12px;border-radius:50%;background:#f59e0b;box-shadow:0 0 8px #f59e0b;}.statusText{color:#f59e0b;font-size:14px;font-weight:bold;}.chartBox{padding:15px;background:#1f2937;border-radius:12px;}.realtimeGrid{display:grid;grid-template-columns:1fr;gap:16px;}.chartTitle{margin-bottom:4px;font-size:16px;font-weight:bold;}.chartUnit{margin-bottom:10px;color:#9ca3af;font-size:13px;}#irChart,#gasAnalogChart,#gasDigitalChart{width:100%;height:300px;display:block;}#gasDigitalChart{height:210px;}.liveControls{margin-top:12px;margin-bottom:5px;}.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:15px;}button{padding:10px 18px;border:none;border-radius:8px;font-size:15px;cursor:pointer;}#pauseBtn{background:#f59e0b;color:#111827;}#clearLiveBtn{background:#374151;color:white;}#clearLogsBtn{background:#7f1d1d;color:white;}.recordPanel{display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap;margin-top:20px;padding:16px 18px;background:#1f2937;border-radius:12px;}.recordInfo{color:#9ca3af;font-size:14px;}.recordStatus{padding:8px 14px;border-radius:20px;font-size:13px;font-weight:bold;}.recordStatus.waiting{background:#374151;color:#d1d5db;}.recordStatus.recording{background:#7f1d1d;color:#fca5a5;}.logSection{margin-top:25px;}.logHeader{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:15px;}.logHeader h2{margin-bottom:0;}.logItem{margin-bottom:18px;padding:18px;background:#1f2937;border-radius:12px;}.logTitleRow{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:15px;}.logTitle{font-size:18px;font-weight:bold;}.logActions{display:flex;gap:8px;flex-wrap:wrap;}.downloadCsvBtn{padding:8px 14px;background:#059669;color:white;font-size:14px;font-weight:bold;}.downloadCsvBtn:hover{filter:brightness(1.08);}.logInfo{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:15px;}.logInfoItem{padding:12px;background:#111827;border-radius:8px;}.logInfoLabel{margin-bottom:5px;color:#9ca3af;font-size:12px;}.logInfoValue{font-size:16px;font-weight:bold;}.logCanvas{width:100%;height:230px;display:block;background:#111827;border-radius:8px;}.logChartGroup{display:grid;grid-template-columns:1fr;gap:14px;}.logChartBlock{position:relative;padding:12px;background:#111827;border-radius:10px;}.logTooltip{position:absolute;z-index:5;top:44px;right:24px;display:none;min-width:210px;padding:10px 12px;background:rgba(3,7,18,0.94);border:1px solid #4b5563;border-radius:8px;color:#e5e7eb;font-size:12px;line-height:1.55;pointer-events:none;box-shadow:0 8px 24px rgba(0,0,0,0.28);}.logTooltip.active{display:block;}.logTooltipTitle{margin-bottom:4px;color:#ffffff;font-weight:bold;}.triggerLegend{margin:0 0 12px;color:#9ca3af;font-size:12px;}.logChartTitle{margin-bottom:10px;color:#d1d5db;font-size:14px;font-weight:bold;}.logChartBlock .logCanvas{background:#0b1220;}.digitalCanvas{height:180px;}.emptyLog{padding:20px;background:#1f2937;color:#9ca3af;border-radius:12px;text-align:center;}@media (max-width:950px){.logInfo{grid-template-columns:repeat(2,1fr);}}@media (max-width:520px){body{padding:12px;}#irChart,#gasAnalogChart{height:260px;}#gasDigitalChart{height:180px;}.logInfo{grid-template-columns:1fr;}.logCanvas{height:200px;}}</style>
 </head>
 <body>
 <noscript><div style="padding:12px;background:#7f1d1d;color:white">Trình duyệt đang tắt JavaScript.</div></noscript>
@@ -104,72 +107,46 @@ const char PAGE[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <div class="header">
 <div>
 <h1>ESP32 Smoke Sensor</h1>
-<div class="subtitle">
-Photodiode GPIO34 + Gas AO GPIO35 + Gas DO GPIO32 — Streaming SSE
-</div>
+<div class="subtitle">Photodiode GPIO34 + Gas AO GPIO35 + Gas DO GPIO32 — Streaming SSE</div>
 </div>
 <div class="statusBox">
 <div id="statusDot" class="statusDot">
 </div>
-<div id="statusText" class="statusText">
-ĐANG KẾT NỐI
-</div>
+<div id="statusText" class="statusText">ĐANG KẾT NỐI</div>
 </div>
 </div>
 <div class="realtimeGrid">
 <div class="chartBox">
-<div class="chartTitle">
-Photodiode IR — GPIO34
-</div>
-<div class="chartUnit">
-Đơn vị: RAW ADC 12 bit
-</div>
+<div class="chartTitle">Photodiode IR — GPIO34</div>
+<div class="chartUnit">Đơn vị: RAW ADC 12 bit</div>
 <canvas id="irChart"></canvas>
 </div>
 <div class="chartBox">
-<div class="chartTitle">
-MP-2 / MQ-2 Analog AO — GPIO35
-</div>
-<div class="chartUnit">
-Đơn vị: RAW ADC 12 bit
-</div>
+<div class="chartTitle">MP-2 / MQ-2 Analog AO — GPIO35</div>
+<div class="chartUnit">Đơn vị: RAW ADC 12 bit</div>
 <canvas id="gasAnalogChart"></canvas>
 </div>
 <div class="chartBox">
-<div class="chartTitle">
-MP-2 / MQ-2 Digital DO — GPIO32
-</div>
-<div class="chartUnit">
-Đơn vị: Logic LOW/HIGH (0/1)
-</div>
+<div class="chartTitle">MP-2 / MQ-2 Digital DO — GPIO32</div>
+<div class="chartUnit">Đơn vị: Logic LOW/HIGH (0/1)</div>
 <canvas id="gasDigitalChart"></canvas>
 </div>
 </div>
 <div class="controls liveControls">
-<button id="pauseBtn" onclick="togglePause()">
-Tạm dừng đồ thị
-</button>
-<button id="clearLiveBtn" onclick="clearLiveData()">
-Xóa dữ liệu hiện tại
-</button>
+<button id="pauseBtn" onclick="togglePause()">Tạm dừng đồ thị</button>
+<button id="clearLiveBtn" onclick="clearLiveData()">Xóa dữ liệu hiện tại</button>
 </div>
 <div class="recordPanel">
 <div>
 <strong>Ghi log tự động</strong>
-<div class="recordInfo" id="recordInfo">
-Bắt đầu khi ADC ≥ 500, kết thúc khi ADC ≤ 400 liên tục 2 giây.
+<div class="recordInfo" id="recordInfo">Bắt đầu khi IR hoặc MP-2 AO ≥ 500 liên tục 5 giây; kết thúc khi cả hai ≤ 400 liên tục 5 giây.</div>
 </div>
-</div>
-<div id="recordStatus" class="recordStatus waiting">
-ĐANG CHỜ TÍN HIỆU
-</div>
+<div id="recordStatus" class="recordStatus waiting">ĐANG CHỜ TÍN HIỆU</div>
 </div>
 <div class="logSection">
 <div class="logHeader">
 <h2>Nhật ký đo</h2>
-<button id="clearLogsBtn" onclick="clearLogs()">
-Xóa toàn bộ log
-</button>
+<button id="clearLogsBtn" onclick="clearLogs()">Xóa toàn bộ log</button>
 </div>
 <div id="logContainer"></div>
 </div>
@@ -184,8 +161,9 @@ const DIGITAL_MIN = 0;
 const DIGITAL_MAX = 1;
 const START_THRESHOLD = 500;
 const STOP_THRESHOLD = 400;
+const START_HOLD_TIME = 5000;
 const PRE_TRIGGER_TIME = 3000;
-const POST_TRIGGER_TIME = 3000;
+const POST_TRIGGER_TIME = 5000;
 const MAX_LOGS = 20;
 const STORAGE_KEY = "esp32_smoke_logs_ir_ao_do_v3";
 const irCanvas = document.getElementById("irChart");
@@ -201,6 +179,7 @@ let paused = false;
 let recording = false;
 let currentLog = null;
 let logHistory = [];
+let aboveThresholdSince = null;
 let belowThresholdSince = null;
 let recentSampleBuffer = [];
 let logCounter = 0;
@@ -221,10 +200,8 @@ function resizeRealtimeCharts() {
   drawGasAnalogRealtimeChart();
   drawGasDigitalRealtimeChart();
 }
-
 window.addEventListener("resize", function() {
-  resizeRealtimeCharts();
-  setTimeout(function() {
+  resizeRealtimeCharts(); setTimeout(function() {
     redrawAllLogCharts();
   }, 50);
 });
@@ -270,7 +247,7 @@ function drawAnalogRealtimeChart(canvas, context, values, yMin, yMax, unitText, 
     const y = top + plotHeight - clamped * plotHeight;
     if (i === 0) {
       context.moveTo(x, y);
-    } else {
+    }else {
       context.lineTo(x, y);
     }
   }
@@ -319,11 +296,11 @@ function drawGasDigitalRealtimeChart() {
   gasDigitalCtx.lineWidth = 2;
   gasDigitalCtx.lineJoin = "miter";
   gasDigitalCtx.beginPath();
-  let previousY = liveGasDigitalData[0] ? yHigh : yLow;
+  let previousY = liveGasDigitalData[0] ? yHigh: yLow;
   gasDigitalCtx.moveTo(left, previousY);
   for (let i = 1; i < liveGasDigitalData.length; i++) {
     const x = left + (i / Math.max(MAX_POINTS - 1, 1)) * plotWidth;
-    const currentY = liveGasDigitalData[i] ? yHigh : yLow;
+    const currentY = liveGasDigitalData[i] ? yHigh: yLow;
     gasDigitalCtx.lineTo(x, previousY);
     if (currentY !== previousY) {
       gasDigitalCtx.lineTo(x, currentY);
@@ -368,28 +345,26 @@ function setRecordStatus(isRecording) {
   if (isRecording) {
     element.innerText = "● ĐANG GHI LOG";
     element.className = "recordStatus recording";
-  } else {
+  }else {
     element.innerText = "ĐANG CHỜ TÍN HIỆU";
     element.className = "recordStatus waiting";
   }
 }
 
-function startLog(irValue, gasAnalogRaw, gasDigitalValue, espTime, preTriggerSamples) {
+function startLog(irValue, gasAnalogRaw, gasDigitalValue, espTime, preTriggerSamples, triggerEspTime) {
   recording = true;
+  aboveThresholdSince = null;
   belowThresholdSince = null;
   logCounter++;
-  const firstSample = preTriggerSamples.length > 0 ? preTriggerSamples[0] : {
-    espTime : espTime
-  };
-  const preTriggerDuration = Math.max(0, espTime - firstSample.espTime);
-  currentLog = {
-    id : logCounter, startDate : new Date(Date.now() - preTriggerDuration).toISOString(), startEspTime : firstSample.espTime, triggerEspTime : espTime, triggerOffset : preTriggerDuration, endDate : null, duration : 0, irValues : [], gasAnalogRawValues : [], gasDigitalValues : [], times : [], irSum : 0, gasAnalogRawSum : 0, count : 0, digitalHighCount : 0, digitalLowCount : 0, maxIR : irValue, maxGasAnalogRaw : gasAnalogRaw, averageIR : 0, averageGasAnalogRaw : 0, digitalHighPercent : 0
-  };
+  const firstSample = preTriggerSamples.length > 0 ? preTriggerSamples[0]: { espTime: espTime };
+  const preTriggerDuration = Math.max(0, triggerEspTime - firstSample.espTime);
+  const bufferedDuration = Math.max(0, espTime - firstSample.espTime);
+  currentLog = { id: logCounter, startDate: new Date(Date.now() - bufferedDuration).toISOString(), startEspTime: firstSample.espTime, triggerEspTime: triggerEspTime, triggerOffset: preTriggerDuration, endDate: null, duration: 0, irValues: [], gasAnalogRawValues: [], gasDigitalValues: [], times: [], irSum: 0, gasAnalogRawSum: 0, count: 0, digitalHighCount: 0, digitalLowCount: 0, maxIR: irValue, maxGasAnalogRaw: gasAnalogRaw, averageIR: 0, averageGasAnalogRaw: 0, digitalHighPercent: 0 };
   setRecordStatus(true);
   for (const sample of preTriggerSamples) {
     addLogSample(sample.irValue, sample.gasAnalogRaw, sample.gasDigitalValue, sample.espTime);
   }
-  console.log("Bat dau log #", currentLog.id, "| pre-trigger =", preTriggerDuration, "ms");
+  console.log("Bat dau log #", currentLog.id, "| pre-trigger =", preTriggerDuration, "ms | xac nhan sau =", START_HOLD_TIME, "ms");
 }
 
 function addLogSample(irValue, gasAnalogRaw, gasDigitalValue, espTime) {
@@ -412,7 +387,7 @@ function addLogSample(irValue, gasAnalogRaw, gasDigitalValue, espTime) {
   }
   if (gasDigitalValue) {
     currentLog.digitalHighCount++;
-  } else {
+  }else {
     currentLog.digitalLowCount++;
   }
 }
@@ -423,9 +398,9 @@ function finishLog(espTime) {
   }
   currentLog.endDate = new Date().toISOString();
   currentLog.duration = espTime - currentLog.startEspTime;
-  currentLog.averageIR = currentLog.count > 0 ? currentLog.irSum / currentLog.count : 0;
-  currentLog.averageGasAnalogRaw = currentLog.count > 0 ? currentLog.gasAnalogRawSum / currentLog.count : 0;
-  currentLog.digitalHighPercent = currentLog.count > 0 ? (currentLog.digitalHighCount / currentLog.count) * 100 : 0;
+  currentLog.averageIR = currentLog.count > 0 ? currentLog.irSum / currentLog.count: 0;
+  currentLog.averageGasAnalogRaw = currentLog.count > 0 ? currentLog.gasAnalogRawSum / currentLog.count: 0;
+  currentLog.digitalHighPercent = currentLog.count > 0 ? (currentLog.digitalHighCount / currentLog.count) * 100: 0;
   logHistory.unshift(currentLog);
   if (logHistory.length > MAX_LOGS) {
     logHistory = logHistory.slice(0, MAX_LOGS);
@@ -435,15 +410,14 @@ function finishLog(espTime) {
   renderLogs();
   currentLog = null;
   recording = false;
+  aboveThresholdSince = null;
   belowThresholdSince = null;
   setRecordStatus(false);
 }
 
 function updateRecentSampleBuffer(irValue, gasAnalogRaw, gasDigitalValue, espTime) {
-  recentSampleBuffer.push({
-    irValue : irValue, gasAnalogRaw : gasAnalogRaw, gasDigitalValue : gasDigitalValue, espTime : espTime
-  });
-  const cutoffTime = espTime - PRE_TRIGGER_TIME;
+  recentSampleBuffer.push( { irValue: irValue, gasAnalogRaw: gasAnalogRaw, gasDigitalValue: gasDigitalValue, espTime: espTime });
+  const cutoffTime = espTime - (PRE_TRIGGER_TIME + START_HOLD_TIME);
   while (recentSampleBuffer.length > 0 && recentSampleBuffer[0].espTime < cutoffTime) {
     recentSampleBuffer.shift();
   }
@@ -452,21 +426,34 @@ function updateRecentSampleBuffer(irValue, gasAnalogRaw, gasDigitalValue, espTim
 function processMeasurement(irValue, gasAnalogRaw, gasDigitalValue, espTime) {
   updateRecentSampleBuffer(irValue, gasAnalogRaw, gasDigitalValue, espTime);
   if (!recording) {
-    if (irValue >= START_THRESHOLD) {
-      const preTriggerSamples = recentSampleBuffer.slice();
-      startLog(irValue, gasAnalogRaw, gasDigitalValue, espTime, preTriggerSamples);
+    const startCondition = irValue >= START_THRESHOLD || gasAnalogRaw >= START_THRESHOLD;
+    if (startCondition) {
+      if (aboveThresholdSince === null) {
+        aboveThresholdSince = espTime;
+      }
+      if (espTime - aboveThresholdSince >= START_HOLD_TIME) {
+        const triggerEspTime = aboveThresholdSince;
+        const preTriggerStartTime = triggerEspTime - PRE_TRIGGER_TIME;
+        const preTriggerSamples = recentSampleBuffer.filter(function(sample) {
+          return sample.espTime >= preTriggerStartTime;
+        });
+        startLog(irValue, gasAnalogRaw, gasDigitalValue, espTime, preTriggerSamples, triggerEspTime);
+      }
+    }else {
+      aboveThresholdSince = null;
     }
     return;
   }
   addLogSample(irValue, gasAnalogRaw, gasDigitalValue, espTime);
-  if (irValue <= STOP_THRESHOLD) {
+  const stopCondition = irValue <= STOP_THRESHOLD && gasAnalogRaw <= STOP_THRESHOLD;
+  if (stopCondition) {
     if (belowThresholdSince === null) {
       belowThresholdSince = espTime;
     }
     if (espTime - belowThresholdSince >= POST_TRIGGER_TIME) {
       finishLog(espTime);
     }
-  } else {
+  }else {
     belowThresholdSince = null;
   }
 }
@@ -476,9 +463,7 @@ function formatDate(dateString) {
     return "-";
   }
   const date = new Date(dateString);
-  return date.toLocaleTimeString("vi-VN", {
-    hour : "2-digit", minute : "2-digit", second : "2-digit"
-  });
+  return date.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function formatDuration(ms) {
@@ -494,7 +479,7 @@ function formatDuration(ms) {
 function saveLogs() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(logHistory));
-  } catch (error) {
+  }catch (error) {
     console.warn("Khong the luu log vao localStorage:", error);
   }
 }
@@ -515,7 +500,7 @@ function loadLogs() {
         logCounter = Number(log.id);
       }
     }
-  } catch (error) {
+  }catch (error) {
     console.warn("Khong the doc log tu localStorage:", error);
     logHistory = [];
   }
@@ -543,7 +528,7 @@ function getLogSampleCount(log) {
     }
     count = Math.min(count, values.length);
   }
-  return Number.isFinite(count) ? count : 0;
+  return Number.isFinite(count) ? count: 0;
 }
 
 function formatRelativeSeconds(seconds) {
@@ -554,7 +539,7 @@ function formatRelativeSeconds(seconds) {
   if (Math.abs(value) < 0.0005) {
     return "0.000 s";
   }
-  return(value > 0 ? "+" : "") + value.toFixed(3) + " s";
+  return(value > 0 ? "+": "") + value.toFixed(3) + " s";
 }
 
 function makeLogCsvFileName(log) {
@@ -588,12 +573,10 @@ function downloadLogCsv(logId) {
     const elapsedMs = Number(log.times[i]);
     const timeSeconds = elapsedMs / 1000;
     const triggerSeconds = (elapsedMs - triggerOffsetMs) / 1000;
-    rows.push([i, timeSeconds.toFixed(3), triggerSeconds.toFixed(3), Number(log.irValues[i]), Number(log.gasAnalogRawValues[i]), Number(log.gasDigitalValues[i]) ? 1 : 0].join(","));
+    rows.push([i, timeSeconds.toFixed(3), triggerSeconds.toFixed(3), Number(log.irValues[i]), Number(log.gasAnalogRawValues[i]), Number(log.gasDigitalValues[i]) ? 1: 0].join(","));
   }
   const csvContent = "\uFEFF" + rows.join("\r\n");
-  const blob = new Blob([csvContent], {
-    type : "text/csv;charset=utf-8;"
-  });
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -614,13 +597,7 @@ function renderLogs() {
     return;
   }
   logHistory.forEach(function(log) {
-    const item = document.createElement("div");
-    item.className = "logItem";
-    const irCanvasId = "logIR_" + log.id;
-    const aoCanvasId = "logAO_" + log.id;
-    const doCanvasId = "logDO_" + log.id;
-    const triggerOffsetMs = getTriggerOffsetMs(log);
-    item.innerHTML = `
+    const item = document.createElement("div"); item.className = "logItem"; const irCanvasId = "logIR_" + log.id; const aoCanvasId = "logAO_" + log.id; const doCanvasId = "logDO_" + log.id; const triggerOffsetMs = getTriggerOffsetMs(log); item.innerHTML = `
 <div class="logTitleRow">
 <div class="logTitle">
 Phiên đo #${log.id}
@@ -717,7 +694,7 @@ ${log.count}
 </div>
 <div class="triggerLegend">
 Trục X dùng thời gian tương đối với trigger: trước trigger là số âm,
-đường đứt đoạn “Trigger 0 s” là thời điểm IR đạt ngưỡng bắt đầu.
+đường đứt đoạn “Trigger 0 s” là thời điểm IR hoặc MP-2 AO bắt đầu đạt ngưỡng và sau đó duy trì điều kiện đủ 5 giây.
 Rê chuột lên bất kỳ đồ thị nào để xem đồng thời IR, MP-2 AO và MP-2 DO.
 </div>
 <div class="logChartGroup">
@@ -761,24 +738,21 @@ class="logTooltip">
 </div>
 </div>
 </div>
-`;
-    container.appendChild(item);
-    const downloadButton = document.getElementById("downloadCSV_" + log.id);
-    if (downloadButton) {
+`; container.appendChild(item); const downloadButton = document.getElementById("downloadCSV_" + log.id); if (downloadButton) {
       downloadButton.onclick = function() {
         downloadLogCsv(log.id);
       };
     }
   });
   setTimeout(function() {
-    redrawAllLogCharts();
-    setupAllLogHoverHandlers();
+    redrawAllLogCharts(); setupAllLogHoverHandlers();
   }, 0);
 }
 const LOG_CHART_LEFT = 52;
 const LOG_CHART_RIGHT = 15;
 const LOG_CHART_TOP = 18;
 const LOG_CHART_BOTTOM = 34;
+
 function prepareLogCanvas(logCanvas) {
   const logCtx = logCanvas.getContext("2d");
   const rect = logCanvas.getBoundingClientRect();
@@ -786,9 +760,7 @@ function prepareLogCanvas(logCanvas) {
   logCanvas.width = rect.width * ratio;
   logCanvas.height = rect.height * ratio;
   logCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
-  return {
-    ctx : logCtx, width : rect.width, height : rect.height, plotWidth : rect.width - LOG_CHART_LEFT - LOG_CHART_RIGHT, plotHeight : rect.height - LOG_CHART_TOP - LOG_CHART_BOTTOM
-  };
+  return { ctx: logCtx, width: rect.width, height: rect.height, plotWidth: rect.width - LOG_CHART_LEFT - LOG_CHART_RIGHT, plotHeight: rect.height - LOG_CHART_TOP - LOG_CHART_BOTTOM };
 }
 
 function getLogLastTimeMs(log) {
@@ -887,7 +859,7 @@ function drawAnalogLogChart(canvasId, log, values, yMin, yMax, unitText, lineCol
   }
   logCtx.fillText(unitText, 5, 12);
   const sampleCount = getLogSampleCount(log);
-  if (sampleCount < 2 ||!Array.isArray(values)) {
+  if (sampleCount < 2 || !Array.isArray(values)) {
     return;
   }
   const lastTimeMs = getLogLastTimeMs(log);
@@ -905,7 +877,7 @@ function drawAnalogLogChart(canvasId, log, values, yMin, yMax, unitText, lineCol
     const y = LOG_CHART_TOP + plotHeight - normalized * plotHeight;
     if (i === 0) {
       logCtx.moveTo(x, y);
-    } else {
+    }else {
       logCtx.lineTo(x, y);
     }
   }
@@ -963,11 +935,11 @@ function drawDigitalLogChart(canvasId, log, hoverIndex) {
   logCtx.lineWidth = 2;
   logCtx.lineJoin = "miter";
   logCtx.beginPath();
-  let previousY = Number(log.gasDigitalValues[0]) ? yHigh : yLow;
+  let previousY = Number(log.gasDigitalValues[0]) ? yHigh: yLow;
   logCtx.moveTo(LOG_CHART_LEFT, previousY);
   for (let i = 1; i < sampleCount; i++) {
     const x = timeToLogX(Number(log.times[i]), lastTimeMs, plotWidth);
-    const currentY = Number(log.gasDigitalValues[i]) ? yHigh : yLow;
+    const currentY = Number(log.gasDigitalValues[i]) ? yHigh: yLow;
     logCtx.lineTo(x, previousY);
     if (currentY !== previousY) {
       logCtx.lineTo(x, currentY);
@@ -979,7 +951,7 @@ function drawDigitalLogChart(canvasId, log, hoverIndex) {
   if (Number.isInteger(hoverIndex) && hoverIndex >= 0 && hoverIndex < sampleCount) {
     const hoverTimeMs = Number(log.times[hoverIndex]);
     const x = drawHoverVerticalLine(logCtx, hoverTimeMs, lastTimeMs, plotWidth, plotHeight);
-    const y = Number(log.gasDigitalValues[hoverIndex]) ? yHigh : yLow;
+    const y = Number(log.gasDigitalValues[hoverIndex]) ? yHigh: yLow;
     logCtx.fillStyle = "#a78bfa";
     logCtx.beginPath();
     logCtx.arc(x, y, 4, 0, Math.PI * 2);
@@ -1020,7 +992,7 @@ function findNearestLogSampleIndex(log, canvas, mouseEvent) {
     const mid = Math.floor((low + high) / 2);
     if (Number(log.times[mid]) < targetTime) {
       low = mid + 1;
-    } else {
+    }else {
       high = mid;
     }
   }
@@ -1030,7 +1002,7 @@ function findNearestLogSampleIndex(log, canvas, mouseEvent) {
   const previous = low - 1;
   const currentDistance = Math.abs(Number(log.times[low]) - targetTime);
   const previousDistance = Math.abs(Number(log.times[previous]) - targetTime);
-  return previousDistance <= currentDistance ? previous : low;
+  return previousDistance <= currentDistance ? previous: low;
 }
 
 function hideLogTooltips(logId) {
@@ -1052,7 +1024,7 @@ function showLogTooltip(log, canvas, sampleIndex) {
   const triggerOffsetMs = getTriggerOffsetMs(log);
   const elapsedMs = Number(log.times[sampleIndex]);
   const relativeSeconds = (elapsedMs - triggerOffsetMs) / 1000;
-  const digitalValue = Number(log.gasDigitalValues[sampleIndex]) ? 1 : 0;
+  const digitalValue = Number(log.gasDigitalValues[sampleIndex]) ? 1: 0;
   tooltip.innerHTML = `
 <div class="logTooltipTitle">
 Mẫu #${sampleIndex}
@@ -1095,11 +1067,11 @@ function setupAllLogHoverHandlers() {
 }
 
 function togglePause() {
-  paused =!paused;
+  paused = !paused;
   const button = document.getElementById("pauseBtn");
   if (paused) {
     button.innerText = "Tiếp tục đồ thị";
-  } else {
+  }else {
     button.innerText = "Tạm dừng đồ thị";
   }
 }
@@ -1131,21 +1103,15 @@ source.onerror = function() {
 };
 source.addEventListener("adc", function(event) {
   try {
-    const packet = JSON.parse(event.data);
-    const irValue = Number(packet.ir);
-    const gasAnalogValue = Number(packet.gasAO);
-    const gasDigitalValue = Number(packet.gasDO);
-    const espTime = Number(packet.time);
-    if (!Number.isFinite(irValue) ||!Number.isFinite(gasAnalogValue) ||!Number.isFinite(gasDigitalValue) ||!Number.isFinite(espTime)) {
+    const packet = JSON.parse(event.data); const irValue = Number(packet.ir); const gasAnalogValue = Number(packet.gasAO); const gasDigitalValue = Number(packet.gasDO); const espTime = Number(packet.time); if (!Number.isFinite(irValue) || !Number.isFinite(gasAnalogValue) || !Number.isFinite(gasDigitalValue) || !Number.isFinite(espTime)) {
       return;
     }
-    addLiveValue(irValue, gasAnalogValue, gasDigitalValue);
-    processMeasurement(irValue, gasAnalogValue, gasDigitalValue, espTime);
-  } catch (error) {
+    addLiveValue(irValue, gasAnalogValue, gasDigitalValue); processMeasurement(irValue, gasAnalogValue, gasDigitalValue, espTime);
+  }catch (error) {
     console.warn("Loi du lieu SSE:", error);
   }
 });
-document.getElementById("recordInfo").innerText = "Bắt đầu theo IR khi ADC ≥ " + START_THRESHOLD + ". Log giữ " + (PRE_TRIGGER_TIME / 1000).toFixed(1) + " giây trước trigger; khi ADC ≤ " + STOP_THRESHOLD + " thì tiếp tục ghi thêm " + (POST_TRIGGER_TIME / 1000).toFixed(1) + " giây rồi kết thúc nếu tín hiệu không tăng lại.";
+document.getElementById("recordInfo").innerText = "Bắt đầu khi IR hoặc MP-2 AO ≥ " + START_THRESHOLD + " liên tục " + (START_HOLD_TIME / 1000).toFixed(1) + " giây. Log vẫn giữ " + (PRE_TRIGGER_TIME / 1000).toFixed(1) + " giây trước trigger; kết thúc khi cả IR và MP-2 AO ≤ " + STOP_THRESHOLD + " liên tục " + (POST_TRIGGER_TIME / 1000).toFixed(1) + " giây.";
 loadLogs();
 renderLogs();
 resizeRealtimeCharts();
@@ -1157,135 +1123,273 @@ setRecordStatus(false);
 // ============================================================================
 // HÀM KẾT NỐI WIFI LẦN ĐẦU
 // ============================================================================
-void connectWiFi() {
+
+void connectWiFi()
+{
     Serial.println();
     Serial.println("========================================");
     Serial.print("Dang ket noi WiFi: ");
     Serial.println(WIFI_SSID);
+
     // ESP32 hoạt động như một thiết bị kết nối vào router/hotspot.
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD
+    );
+
     // Chờ kết nối.
-    while (WiFi.status() != WL_CONNECTED) {
+    while (
+        WiFi.status() !=
+        WL_CONNECTED
+    )
+    {
         delay(500);
         Serial.print(".");
     }
+
     Serial.println();
     Serial.println("Da ket noi WiFi.");
+
     Serial.print("Dia chi IP: ");
-    Serial.println(WiFi.localIP());
+    Serial.println(
+        WiFi.localIP()
+    );
+
     Serial.println("========================================");
 }
 
 // ============================================================================
 // HÀM THỬ KẾT NỐI LẠI WIFI
 // ============================================================================
-void reconnectWiFiIfNeeded(unsigned long currentTime) {
+
+void reconnectWiFiIfNeeded(
+    unsigned long currentTime
+)
+{
     // Nếu Wi-Fi vẫn còn kết nối thì không làm gì.
-    if (WiFi.status() == WL_CONNECTED) {
+    if (
+        WiFi.status() ==
+        WL_CONNECTED
+    )
+    {
         return;
     }
+
     // Không reconnect liên tục.
-    if (currentTime - lastWiFiReconnectTime < WIFI_RECONNECT_INTERVAL_MS) {
+    if (
+        currentTime -
+        lastWiFiReconnectTime <
+        WIFI_RECONNECT_INTERVAL_MS
+    )
+    {
         return;
     }
-    lastWiFiReconnectTime = currentTime;
-    Serial.println("Mat WiFi. Dang thu ket noi lai...");
+
+    lastWiFiReconnectTime =
+        currentTime;
+
+    Serial.println(
+        "Mat WiFi. Dang thu ket noi lai..."
+    );
+
     WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD
+    );
 }
 
 // ============================================================================
 // SETUP
 // ============================================================================
-void setup() {
 
+void setup()
+{
     // ------------------------------------------------------------------------
     // SERIAL MONITOR
     // ------------------------------------------------------------------------
-    Serial.begin(115200);
-    delay(500);
+
+    Serial.begin(
+        115200
+    );
+
+    delay(
+        500
+    );
 
     // ------------------------------------------------------------------------
     // ADC
     // ------------------------------------------------------------------------
-    pinMode(IR_PIN, INPUT);
-    pinMode(GAS_AO_PIN, INPUT);
-    pinMode(GAS_DO_PIN, INPUT);
+
+    pinMode(
+        IR_PIN,
+        INPUT
+    );
+
+    pinMode(
+        GAS_AO_PIN,
+        INPUT
+    );
+
+    pinMode(
+        GAS_DO_PIN,
+        INPUT
+    );
+
     // ADC 12 bit => giá trị từ 0 đến 4095.
-    analogReadResolution(ADC_RESOLUTION_BITS);
+    analogReadResolution(
+        ADC_RESOLUTION_BITS
+    );
+
     // Cấu hình attenuation cho cả hai kênh ADC1.
     // Dù vậy, điện áp thực tế đưa vào GPIO34/GPIO35 vẫn phải nằm
     // trong giới hạn an toàn của ESP32.
-    analogSetPinAttenuation(IR_PIN, ADC_11db);
-    analogSetPinAttenuation(GAS_AO_PIN, ADC_11db);
+    analogSetPinAttenuation(
+        IR_PIN,
+        ADC_11db
+    );
+
+    analogSetPinAttenuation(
+        GAS_AO_PIN,
+        ADC_11db
+    );
 
     // ------------------------------------------------------------------------
     // WIFI
     // ------------------------------------------------------------------------
+
     connectWiFi();
 
     // ------------------------------------------------------------------------
     // ROUTE TRANG CHÍNH
     // ------------------------------------------------------------------------
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->send_P(200, "text/html", PAGE);
-    });
+
+    server.on(
+        "/",
+        HTTP_GET,
+        [](AsyncWebServerRequest* request)
+        {
+            request->send_P(
+                200,
+                "text/html",
+                PAGE
+            );
+        }
+    );
 
     // ------------------------------------------------------------------------
     // KHI TRÌNH DUYỆT KẾT NỐI VÀO SSE
     // ------------------------------------------------------------------------
-    events.onConnect([](AsyncEventSourceClient* client) {
-        Serial.println("Web client da ket noi SSE.");
-        // Gửi một gói để trình duyệt biết kết nối đã sẵn sàng.
-        // reconnect = 1000 ms: nếu mất kết nối, browser thử reconnect sau 1 s.
-        client->send("connected", NULL, millis(), 1000);
-    });
+
+    events.onConnect(
+        [](AsyncEventSourceClient* client)
+        {
+            Serial.println(
+                "Web client da ket noi SSE."
+            );
+
+            // Gửi một gói để trình duyệt biết kết nối đã sẵn sàng.
+            // reconnect = 1000 ms: nếu mất kết nối, browser thử reconnect sau 1 s.
+            client->send(
+                "connected",
+                NULL,
+                millis(),
+                1000
+            );
+        }
+    );
+
     // Gắn SSE handler vào Web Server.
-    server.addHandler(&events);
+    server.addHandler(
+        &events
+    );
 
     // ------------------------------------------------------------------------
     // KHỞI ĐỘNG WEB SERVER
     // ------------------------------------------------------------------------
+
     server.begin();
-    Serial.println("Web Server da khoi dong.");
-    Serial.print("Mo trinh duyet tai: http://");
-    Serial.println(WiFi.localIP());
+
+    Serial.println(
+        "Web Server da khoi dong."
+    );
+
+    Serial.print(
+        "Mo trinh duyet tai: http://"
+    );
+
+    Serial.println(
+        WiFi.localIP()
+    );
 }
 
 // ============================================================================
 // LOOP
 // ============================================================================
-void loop() {
-    const unsigned long currentTime = millis();
+
+void loop()
+{
+    const unsigned long currentTime =
+        millis();
 
     // ------------------------------------------------------------------------
     // KIỂM TRA / KẾT NỐI LẠI WIFI
     // ------------------------------------------------------------------------
-    reconnectWiFiIfNeeded(currentTime);
+
+    reconnectWiFiIfNeeded(
+        currentTime
+    );
+
     // Nếu chưa có Wi-Fi thì không gửi dữ liệu web.
-    if (WiFi.status() != WL_CONNECTED) {
+    if (
+        WiFi.status() !=
+        WL_CONNECTED
+    )
+    {
         return;
     }
 
     // ------------------------------------------------------------------------
     // KIỂM TRA ĐÃ ĐẾN CHU KỲ LẤY MẪU CHƯA
     // ------------------------------------------------------------------------
-    if (currentTime - lastSampleTime < SAMPLE_INTERVAL_MS) {
+
+    if (
+        currentTime -
+        lastSampleTime <
+        SAMPLE_INTERVAL_MS
+    )
+    {
         return;
     }
-    lastSampleTime = currentTime;
+
+    lastSampleTime =
+        currentTime;
 
     // ------------------------------------------------------------------------
     // ĐỌC HAI KÊNH ADC
     // ------------------------------------------------------------------------
+
     // Tín hiệu photodiode hồng ngoại.
-    const int irValue = analogRead(IR_PIN);
+    const int irValue =
+        analogRead(
+            IR_PIN
+        );
+
     // Tín hiệu Analog Output (AO) raw từ cảm biến MP-2/MQ-2.
-    const int gasAnalogValue = analogRead(GAS_AO_PIN);
+    const int gasAnalogValue =
+        analogRead(
+            GAS_AO_PIN
+        );
+
     // Tín hiệu Digital Output (DO) từ comparator trên module.
     // Kết quả chỉ là LOW (0) hoặc HIGH (1).
-    const int gasDigitalValue = digitalRead(GAS_DO_PIN);
+    const int gasDigitalValue =
+        digitalRead(
+            GAS_DO_PIN
+        );
 
     // ------------------------------------------------------------------------
     // TẠO GÓI JSON
@@ -1298,24 +1402,65 @@ void loop() {
     // gasDO : RAW digital chân DO GPIO32, 0 hoặc 1
     // time  : millis() của ESP32, đơn vị ms
     // ------------------------------------------------------------------------
+
     char json[96];
-    snprintf(json, sizeof(json), "{\"ir\":%d,\"gasAO\":%d,\"gasDO\":%d,\"time\":%lu}", irValue, gasAnalogValue, gasDigitalValue, currentTime);
+
+    snprintf(
+        json,
+        sizeof(json),
+        "{\"ir\":%d,\"gasAO\":%d,\"gasDO\":%d,\"time\":%lu}",
+        irValue,
+        gasAnalogValue,
+        gasDigitalValue,
+        currentTime
+    );
 
     // ------------------------------------------------------------------------
     // STREAM GÓI DỮ LIỆU TỚI TẤT CẢ TRÌNH DUYỆT ĐANG KẾT NỐI
     // ------------------------------------------------------------------------
-    events.send(json, "adc", currentTime);
+
+    events.send(
+        json,
+        "adc",
+        currentTime
+    );
 
     // ------------------------------------------------------------------------
     // IN GIÁ TRỊ RA SERIAL MONITOR
     // ------------------------------------------------------------------------
-    if (currentTime - lastSerialPrintTime >= SERIAL_PRINT_INTERVAL_MS) {
-        lastSerialPrintTime = currentTime;
-        Serial.print("IR ADC = ");
-        Serial.print(irValue);
-        Serial.print(" | GAS AO = ");
-        Serial.print(gasAnalogValue);
-        Serial.print(" | GAS DO = ");
-        Serial.println(gasDigitalValue);
+
+    if (
+        currentTime -
+        lastSerialPrintTime >=
+        SERIAL_PRINT_INTERVAL_MS
+    )
+    {
+        lastSerialPrintTime =
+            currentTime;
+
+        Serial.print(
+            "IR ADC = "
+        );
+
+        Serial.print(
+            irValue
+        );
+
+        Serial.print(
+            " | GAS AO = "
+        );
+
+        Serial.print(
+            gasAnalogValue
+        );
+
+        Serial.print(
+            " | GAS DO = "
+        );
+
+        Serial.println(
+            gasDigitalValue
+        );
     }
+
 }

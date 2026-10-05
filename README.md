@@ -1,4 +1,4 @@
-# TTTN – Hệ thống nhúng đo và giám sát khói ứng dụng học máy trên ESP32
+# Machine Learning-Based Real-Time Smoke Concentration Measurement System Using Optical Sensors on Edge Devices 
 
 ## 1. Tổng quan
 

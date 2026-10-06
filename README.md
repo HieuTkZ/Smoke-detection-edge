@@ -41,7 +41,7 @@ Mô hình cuối vẫn được triển khai trên ESP32 dưới dạng một ph
 ```text
 TTTN/
 │
-├── SmokeMonitor/
+├── SmokeMonitor_PCB
 │   ├── Esp32_SmokeMonitor.pdsprj
 │   └── Esp32_SmokeMonitor.pdsprj....workspace
 │
